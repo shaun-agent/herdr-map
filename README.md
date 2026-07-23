@@ -17,28 +17,28 @@ It is a single Rust binary that:
 - is **mouse-first and keyboard-first at the same time** (click/drag/split *and* tmux-style prefix keys).
 
 ```mermaid
-graph TB
-    subgraph You["You (any terminal, attach/detach at will)"]
+flowchart LR
+    subgraph client["you — any terminal, attach / detach at will"]
         TUI["herdr TUI client"]
     end
 
-    subgraph Server["herdr server (background daemon)"]
-        WS["Workspaces / Tabs / Panes"]
-        DET["Agent detection<br/>blocked · working · done"]
-        API["Socket API"]
+    subgraph server["herdr server — background daemon"]
+        direction TB
+        WS["workspaces · tabs · panes"]
+        DET["agent detection<br/>blocked · working · done"]
+        API["socket API"]
     end
 
-    subgraph Agents["Real agent processes in real PTYs"]
-        A1["Claude Code"]
-        A2["Codex"]
-        A3["Gemini / opencode / …"]
-        SH["plain shells, servers, logs"]
+    subgraph agents["real agent processes in real PTYs"]
+        direction TB
+        A1["Claude Code · Codex · Gemini · opencode · …"]
+        SH["plain shells · servers · logs"]
     end
 
-    TUI <-->|"frames + input"| Server
-    WS --> A1 & A2 & A3 & SH
-    DET -.->|"reads screens"| Agents
-    A1 & A2 -->|"can also drive herdr"| API
+    TUI <== "frames + input" ==> server
+    WS <-- "PTY bytes" --> agents
+    DET -. "reads screens" .-> agents
+    agents -- "spawn · read · prompt · wait" --> API
 ```
 
 ---
