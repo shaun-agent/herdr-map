@@ -311,6 +311,68 @@ flowchart LR
 
 Structure survives; live processes don't — each pane respawns a fresh shell in its saved cwd. But because integrations persist **agent session references**, herdr can resume the actual agent *conversations* (e.g. a Claude Code session) after a reboot, which is the part users actually care about.
 
+### 5.7 Remote access: two modes, and what they cost you
+
+herdr's client/server split means "remote" has two legitimate answers, and picking the wrong one is the usual source of confusion.
+
+```mermaid
+flowchart TB
+    subgraph A["Mode A — herdr --remote (thin client bridges SSH)"]
+        direction LR
+        LA["local herdr<br/>(TUI client)"] -->|"ssh: frames + input"| RA["remote herdr server<br/>panes · agents"]
+        LA -.->|"bridges local desktop<br/>e.g. image clipboard paste"| RA
+    end
+    subgraph B["Mode B — ssh first, then run herdr there"]
+        direction LR
+        LB["any SSH client<br/>(incl. phone)"] -->|"plain ssh session"| RB["remote herdr<br/>client + server, both remote"]
+    end
+```
+
+| | Mode A `herdr --remote <target>` | Mode B `ssh box` then `herdr` |
+| --- | --- | --- |
+| Where the TUI client runs | your machine | the server |
+| Needs herdr installed locally | **yes** — the local binary *is* the client | no |
+| Local desktop integration | yes (clipboard image paste bridged to a remote temp file) | terminal text paste only |
+| Keybindings | local by default (`--remote-keybindings server` to flip) | remote config |
+| Works from a phone | no (see below) | **yes** |
+
+Mode A auto-provisions: herdr detects the remote platform (Linux/macOS, x86_64/aarch64), prefers a matching `herdr` already on the remote `PATH`, checks common Homebrew/mise/Nix paths, and offers to install to `~/.local/bin/herdr` if none exists — interactive runs prompt, non-interactive runs fail rather than silently modifying the host.
+
+#### Using it from a mobile phone
+
+Use **Mode B**. `herdr --remote` requires a local herdr binary acting as the client, and phones can't run one (iOS forbids it outright; Android via Termux is unofficial territory). So the mobile recipe is the boring one, and it works well:
+
+1. Install any SSH client — Termius, Blink, a-Shell (iOS), Termux (Android).
+2. `ssh yourbox`, then run `herdr`. You attach to the same durable server your laptop uses, with every pane and agent exactly where you left them.
+3. Detach with `ctrl+b q` — agents keep running after you close the app.
+
+This is precisely the payoff of the durable-server design: the phone is just another disposable client. Two practical notes: **load your SSH key into `ssh-agent`** if it's passphrase-protected, since mobile terminals often can't render the passphrase prompt; and pick an SSH app with a decent modifier-key row, because `ctrl+b` is the prefix for everything.
+
+#### Does it work with Cloudflare Tunnel?
+
+**Yes — Mode A included, and this is the useful part.** `herdr --remote` doesn't implement its own transport; it shells out to OpenSSH. Its generated config `Include`s your real `~/.ssh/config` *first*, then appends only fallback keepalives and a private per-attach control socket (your own settings win on conflict). So anything OpenSSH honors — `ProxyCommand`, jump hosts, certificates — herdr honors too.
+
+```mermaid
+flowchart LR
+    C["herdr --remote workbox"] --> S["ssh (herdr config:<br/>Include ~/.ssh/config first)"]
+    S -->|"ProxyCommand"| CF["cloudflared access ssh"]
+    CF -->|"outbound tunnel, no open ports"| E["Cloudflare edge"]
+    E --> D["cloudflared on host"] --> H["herdr server"]
+```
+
+Put the tunnel in your SSH config once:
+
+```text
+Host workbox
+  HostName ssh.example.com
+  User you
+  ProxyCommand cloudflared access ssh --hostname %h
+```
+
+Then `herdr --remote workbox` just works — no inbound firewall rule, no public SSH port, and Cloudflare Access policies gate who may connect. If the generated config ever fights your setup, `[remote].manage_ssh_config = false` drops herdr back to plain `ssh`.
+
+For phones, Cloudflare's browser-rendered SSH terminal is a genuine option too: it puts you at a shell without an SSH app at all — then run `herdr` there (Mode B).
+
 ---
 
 ## 6. The one-diagram summary
