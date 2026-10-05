@@ -1,6 +1,6 @@
 # herdr — a mental map
 
-> A structured mental model of [herdr](https://github.com/ogulcancelik/herdr): what it is, what problem it solves, why its design works, and the core concepts that make the machine tick. Derived from the source tree and docs (Apache-2.0).
+> A structured mental model of [herdr](https://github.com/ogulcancelik/herdr): what it is, what problem it solves, why its design works, and the core concepts that make the machine tick. Derived from the source tree and docs (Apache-2.0). **Current as of herdr 0.9.3 (2026-09-29).**
 
 ---
 
@@ -160,7 +160,9 @@ sequenceDiagram
     M->>S: reattach → same session
 ```
 
-The server is *headless*: it runs the full UI loop and renders into an in-memory buffer even with zero clients attached, then streams diffs to each client. That's why attach/detach is instant and why multiple clients can watch the same session.
+The server is *headless*: it keeps every pane's terminal state live even with zero clients attached. Since 0.9.0 the split is cleaner than "server renders, client displays": **the terminal UI now runs in each client**, so themes, menus, and copy mode are local to the viewing machine, and **multiple clients can view different workspaces and tabs independently** — when clients share a tab, the last one to interact controls its size. The server stays the single owner of state and terminal content; the client owns presentation. That's why attach/detach is instant and why three people (or one person on three devices) can watch different corners of the same session.
+
+Version skew is handled on the same seam: a client update can leave a compatible running server (and its agents) untouched, and a missing server feature disables only the affected action instead of refusing the connection.
 
 ### 5.2 Data model: state, identity, and runtime are separated
 
@@ -259,11 +261,13 @@ flowchart TD
     Q2 --> ST["blocked · working · done · idle · unknown"]
 
     HOOK["official integration hooks<br/>(agent reports its own lifecycle)"] -->|"authoritative, overrides inference"| ST
+    SELF["self-reported agents (0.9.2)<br/>any agent calls pane report-agent<br/>state + its own resume command"] -->|"authoritative, no integration needed"| ST
 ```
 
 - **Manifests are data, not code**: `src/detect/manifests/<agent>.toml` files describe visible evidence ("this approval prompt text in the bottom lines ⇒ blocked") with AND/OR gates and priorities. Highest-priority match wins.
 - **Hot-reloadable and updatable**: local override files and remote-fetched manifests shadow the bundled ones, so a UI change in an agent can be fixed without shipping a new herdr binary.
 - **Hooks beat heuristics**: agents with installed integrations (shell hooks that call back into herdr with `HERDR_PANE_ID`) report state directly and take authority over screen inference.
+- **Any agent can opt in without an integration (0.9.2)**: an agent can report its own state *and its own resume command*; herdr then reopens its exact session after a server restart with no built-in integration at all, and clears the registration once its pane is back at an idle shell. There's an official "Add Herdr support to your agent" guide for agent authors — detection is no longer only something herdr does *to* agents; it's a contract agents can join.
 
 ### 5.5 The socket API: herdr as a runtime *for* agents
 
@@ -295,7 +299,9 @@ flowchart LR
     W1 & W2 & W3 -.->|"screens & states"| api
 ```
 
-Three layers share one control surface: an **agent skill** (teaches agents the verbs), **CLI wrappers** (`herdr pane run w1:p2 "npm test"`, `herdr agent wait w1:p1 --until done`), and the **raw JSON socket** (~100 dot-notation methods, self-describing via `herdr api schema`). `agent.wait` is server-owned and pins the pane occupant, so a replacement process can't falsely satisfy the wait — the races you'd hit with polling scripts are handled in the runtime.
+Three layers share one control surface: an **agent skill** (teaches agents the verbs; `herdr --skill` prints the one bundled with the running binary), **CLI wrappers** (`herdr pane run w1:p2 "npm test"`, `herdr agent wait w1:p1 --until done`), and the **raw JSON socket** (~100 dot-notation methods, self-describing via `herdr api schema`). `agent.wait` is server-owned and pins the pane occupant, so a replacement process can't falsely satisfy the wait — the races you'd hit with polling scripts are handled in the runtime.
+
+Two semantics worth knowing before building on `events.subscribe` (both 0.9.x): a **new subscription starts with live events only** — it does not replay retained history, so subscribe *before* taking your initial snapshot; and a reader that falls too far behind now gets an explicit **`events_lost` error** instead of silently skipping events. One removal: the herdr-specific pane-graphics API is gone (0.9.2) — apps show images by writing standard Kitty graphics to their terminal, which herdr renders natively.
 
 ### 5.6 Persistence: what survives a restart
 
@@ -309,11 +315,13 @@ flowchart LR
     R -->|"resume_agents_on_restore"| RA["re-enter native agent conversations<br/>via saved session refs"]
 ```
 
-Structure survives; live processes don't — each pane respawns a fresh shell in its saved cwd. But because integrations persist **agent session references**, herdr can resume the actual agent *conversations* (e.g. a Claude Code session) after a reboot, which is the part users actually care about.
+Structure survives; live processes don't — each pane respawns a fresh shell in its saved cwd. But because integrations persist **agent session references**, herdr can resume the actual agent *conversations* (e.g. a Claude Code session) after a reboot, which is the part users actually care about. Since 0.9.2 that resume path no longer requires an integration: **self-reported agents hand herdr their own resume command**, and herdr replays it.
 
-### 5.7 Remote access: two modes, and what they cost you
+Three durability details added in 0.9.x: restored agents start **staggered** (100 ms apart by default, `[session] startup_per_agent_delay_ms`) instead of stampeding at once; up to **48 layout snapshots** are kept in `session-snapshots/` (on Linux with logind, herdr saves before system shutdown) for manual recovery; and a saved session that fails to load is **preserved in `session-backups/` before replacement** rather than silently overwritten.
 
-herdr's client/server split means "remote" has two legitimate answers, and picking the wrong one is the usual source of confusion.
+### 5.7 Remote access: three modes, and what they cost you
+
+herdr's client/server split means "remote" has three legitimate answers, and picking the wrong one is the usual source of confusion. Modes A and B are per-attach, one machine at a time. Mode C — **saved machines**, built out across 0.9.0–0.9.2 — makes remote sessions a persistent, first-class part of your one local window.
 
 ```mermaid
 flowchart TB
@@ -326,17 +334,30 @@ flowchart TB
         direction LR
         LB["any SSH client<br/>(incl. phone)"] -->|"plain ssh session"| RB["remote herdr<br/>client + server, both remote"]
     end
+    subgraph C["Mode C — saved machines (0.9.x): one window, N machines"]
+        direction LR
+        LC["your one herdr window<br/>Local + machine sidebar groups<br/>combined agent list"] <-->|"persistent SSH<br/>auto-reconnect · compression<br/>row-diff updates"| RC1["machine: workbox"]
+        LC <--> RC2["machine: gpu-box"]
+        CLI["herdr --machine workbox agent wait …<br/>(CLI forwarding, no window needed)"] --> RC1
+    end
 ```
 
-| | Mode A `herdr --remote <target>` | Mode B `ssh box` then `herdr` |
-| --- | --- | --- |
-| Where the TUI client runs | your machine | the server |
-| Needs herdr installed locally | **yes** — the local binary *is* the client | no |
-| Local desktop integration | yes (clipboard image paste bridged to a remote temp file) | terminal text paste only |
-| Keybindings | local by default (`--remote-keybindings server` to flip) | remote config |
-| Works from a phone | no (see below) | **yes** |
+| | Mode A `herdr --remote <target>` | Mode B `ssh box` then `herdr` | Mode C saved machines |
+| --- | --- | --- | --- |
+| Where the TUI client runs | your machine | the server | your machine (one window for all) |
+| Needs herdr installed locally | **yes** — the local binary *is* the client | no | **yes**, and on each machine |
+| Scope | one machine per attach | one machine per ssh | **Local + many machines at once**, combined agent list, machine-scoped notifications |
+| Connection lifecycle | per-attach | per-ssh | **persistent**: auto-reconnect, failed machines rechecked every 30 s, one dead machine never blocks the rest |
+| Headless control | no | no | **yes** — `herdr --machine <label> <cmd>` drives a saved machine's session with no window open (never silently falls back to Local) |
+| Works from a phone | no (see below) | **yes** | no |
 
 Mode A auto-provisions: herdr detects the remote platform (Linux/macOS, x86_64/aarch64), prefers a matching `herdr` already on the remote `PATH`, checks common Homebrew/mise/Nix paths, and offers to install to `~/.local/bin/herdr` if none exists — interactive runs prompt, non-interactive runs fail rather than silently modifying the host.
+
+#### Mode C in practice
+
+`herdr machine add user@host` is interactive: it discovers the herdr sessions already running on the host and lets you pick one (`--label` optional — the machine defaults to its SSH host name). After that, the machine appears as a sidebar group in your one window; workspace navigation spans machines in sidebar order. `herdr machine status` checks saved machines without prompting, and `herdr machine reconnect` finishes SSH auth — MFA included — in your terminal. The transport is tuned for this always-on shape: SSH compression is requested, and scrolling output sends only changed rows, which is what makes watching build logs or streaming agents on a saved machine affordable over slow links.
+
+The strategic consequence: **the orchestration surface (§5.5) now spans machines.** A Main agent on your laptop can `herdr --machine gpu-box agent wait …` against a worker running on another host — the "runtime for agents" stops being single-machine.
 
 #### Using it from a mobile phone
 
@@ -414,5 +435,6 @@ flowchart TB
 | Public JSON API | `src/api/` (methods in `src/api/schema.rs`) |
 | Private client protocol | `src/protocol/` (`PROTOCOL_VERSION`) |
 | Persistence / restore | `src/persist/`, `src/agent_resume.rs` |
+| Saved machines (Mode C) | `src/cli/machine.rs`, `src/remote.rs`, `src/client/` |
 | Integrations (agent hooks) | `src/integration/` |
 | Platform isolation | `src/platform/<os>.rs` |
